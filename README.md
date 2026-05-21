@@ -44,6 +44,7 @@ between siblings so no IV or chaining is needed.
 
 ```
 ggm_tree/
+├── aes_cpu.c
 ├── aes_prf.py
 ├── blake2s_prf.py
 ├── ggm_tree.py
@@ -144,6 +145,7 @@ during computation.
 
 ### implemented
 - [x] AES-128 from scratch in pure Python (CPU) - verified against NIST FIPS 197 vectors
+- [x] AES-128 from scratch in pure C (CPU)
 - [x] AES-128 GPU kernel (CuPy RawKernel, CUDA C)
 - [x] GGM tree BFS expansion on CPU and GPU (AES)
 - [x] Correctness tests: NIST vectors, CPU self-consistency, CPU path-following determinism
