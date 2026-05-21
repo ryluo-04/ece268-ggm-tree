@@ -1,18 +1,10 @@
 """
-aes_prf.py — AES-128 based PRG for GGM tree construction.
-
-PRG definition:
-    G(k) = AES_k(0^128) || AES_k(1 || 0^120)
-
-both the cpu and gpu implementations are written from scratch — no crypto libraries.
-the cpu version uses plain python lists; the gpu version is a cupy rawkernel (cuda c).
-ecb mode is safe here because each node key is independent (no need for an iv or chaining).
+AES-128 based PRG for GGM tree construction
 """
 
 import numpy as np
 
 # cpu implementation
-
 # rijndael substitution box (FIPS 197, figure 7)
 SBOX = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -33,9 +25,8 @@ SBOX = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ]
 
-# round constants: RCON[i] = x^i in GF(2^8), for i = 1..10 (indices 0..9 here)
+# round constants
 RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
-
 
 def xtime(b: int) -> int:
     """
@@ -43,20 +34,16 @@ def xtime(b: int) -> int:
     """
     return ((b << 1) ^ 0x1b) & 0xff if b & 0x80 else (b << 1) & 0xff
 
-
 def sub_bytes(state: list) -> list:
     """
     apply sbox substitution to each byte of the 16-byte state
     """
     return [SBOX[b] for b in state]
 
-
 def shift_rows(state: list) -> list:
     """
-    cyclic left shift rows: row r shifts left by r positions
-
-    state is column-major: column c occupies flat indices 4c, 4c+1, 4c+2, 4c+3.
-    row r contains indices r, r+4, r+8, r+12.
+    cyclic left shift rows
+    row r shifts left by r positions
     """
     s = state
     return [
@@ -66,17 +53,9 @@ def shift_rows(state: list) -> list:
         s[12], s[ 1], s[ 6], s[11],   # row 3: shift left 3
     ]
 
-
 def mix_columns(state: list) -> list:
     """
-    mix each column using the AES MDS matrix in GF(2^8)
-
-    column [a0,a1,a2,a3] maps to [b0,b1,b2,b3] per FIPS 197 eq. 4.13:
-    b0 = 2*a0 ^ 3*a1 ^   a2 ^   a3
-    b1 =   a0 ^ 2*a1 ^ 3*a2 ^   a3
-    b2 =   a0 ^   a1 ^ 2*a2 ^ 3*a3
-    b3 = 3*a0 ^   a1 ^   a2 ^ 2*a3
-    where 3*x = xtime(x) ^ x
+    mix columns using AES MDS matrix
     """
     result = list(state)
     for c in range(4):
@@ -98,11 +77,7 @@ def add_round_key(state: list, rk: list) -> list:
 
 def key_expansion(key: bytes) -> list:
     """
-    expand a 16 byte key into 11 round keys (FIPS 197 section 5.2)
-
-    returns:
-        list of 11 items each a flat list of 16 ints
-        key schedule produces 44 words (w[0..43]) and round key r uses w[4r..4r+3]
+    expand 16 byte key into 11 round keys
     """
     # seed word array from the original key
     w = [list(key[4*i : 4*i+4]) for i in range(4)]
@@ -126,7 +101,9 @@ def key_expansion(key: bytes) -> list:
 
 
 def aes_encrypt_block(block: bytes, key: bytes) -> bytes:
-    """encrypt one 16-byte block with AES-128 (10 rounds, FIPS 197 section 5.1)."""
+    """
+    encrypt 16 byte block with AES-128 (10 rounds)
+    """
     assert len(block) == 16 and len(key) == 16
     rks = key_expansion(key)
     state = list(block)
@@ -148,11 +125,8 @@ def aes_encrypt_block(block: bytes, key: bytes) -> bytes:
 
 
 def aes_prf_cpu(key: bytes) -> tuple:
-    """evaluate the AES-128 PRG on a single 16-byte key.
-
-    returns (left_child, right_child) each 16 bytes, where:
-        left  = AES_key(0x00 * 16)
-        right = AES_key(0x01 + 0x00 * 15)
+    """
+    evaluate AES-128 PRG on a single 16 byte key
     """
     assert len(key) == 16, "AES key must be exactly 16 bytes"
     left  = aes_encrypt_block(b"\x00" * 16,        key)
@@ -161,12 +135,8 @@ def aes_prf_cpu(key: bytes) -> tuple:
 
 
 def aes_expand_level_cpu(keys: np.ndarray) -> np.ndarray:
-    """expand one GGM tree level on cpu (sequential).
-
-    args:
-        keys: uint8 array of shape (N, 16) parent node seeds.
-    returns:
-        uint8 array of shape (2N, 16) children [left_0, right_0, left_1, right_1, ...]
+    """
+    expand one GGM tree level on cpu (sequential)
     """
     n = keys.shape[0]
     children = np.empty((2 * n, 16), dtype=np.uint8)
@@ -343,13 +313,8 @@ def _get_aes_kernel():
 
 
 def aes_expand_level_gpu(keys_gpu):
-    """expand one GGM tree level on the GPU using the AES-128 PRG.
-
-    args:
-        keys_gpu: CuPy uint8 array of shape (N, 16) parent node seeds on device.
-    returns:
-        CuPy uint8 array of shape (2N, 16) children on device.
-        data stays on device between levels to avoid PCIe round-trips.
+    """
+    expand one GGM tree level on the GPU using AES-128 PRG
     """
     import cupy as cp
 
