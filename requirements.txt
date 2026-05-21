@@ -1,0 +1,5 @@
+numpy>=1.22
+matplotlib>=3.5
+# cupy: install the wheel matching your CUDA version
+# cupy-cuda11x for CUDA 11, cupy-cuda12x for CUDA 12
+# hashlib is python stdlib, no install needed

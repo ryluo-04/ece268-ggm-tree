@@ -1,0 +1,126 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red!70!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+}
+
+\title{ECE 268 Final Project Progress Report: GGM Tree Construction on GPU}
+\author{Kevin Liang \quad Bryce Blair \quad Ryan Luo}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Project Overview}
+
+This project implements the Goldreich-Goldwasser-Micali (GGM) pseudorandom function (PRF) tree construction entirely from scratch on the GPU, benchmarks it against CPU equivalents, and analyzes the resulting performance-security tradeoffs.
+
+The GGM construction builds a secure PRF from any length-doubling pseudorandom generator (PRG) by expanding a short seed into a binary tree of pseudorandom values. At each node the current value is passed through a PRG to produce two child values, one for bit 0 and one for bit 1. Evaluating the PRF on an input $x \in \{0,1\}^n$ amounts to following the root-to-leaf path dictated by the bits of $x$.
+
+We implement two PRF backends. PRF-1 is AES-128, used as a PRG by encrypting two fixed plaintexts under the node seed as a key:
+\[
+G(k) = \text{AES}_k(0^{128}) \,\|\, \text{AES}_k(1 \cdot 0^{120})
+\]
+PRF-2 is BLAKE2s, used as a keyed hash:
+\[
+G(k) = \text{BLAKE2s}(k,\, \texttt{0x00}) \,\|\, \text{BLAKE2s}(k,\, \texttt{0x01})
+\]
+Both are implemented from scratch with no external cryptographic libraries. GPU kernels are written in CUDA C and compiled at runtime via CuPy \texttt{RawKernel}.
+
+\section{Current Progress}
+
+\subsection{Repository Structure}
+
+The project is organized with the following files:
+\begin{itemize}
+    \item \texttt{aes\_prf.py} - AES-128 PRG: full CPU implementation in Python and a GPU kernel in CUDA C compiled via CuPy \texttt{RawKernel}.
+    \item \texttt{blake2s\_prf.py} - BLAKE2s PRG: CPU and GPU implementations.
+    \item \texttt{ggm\_tree.py} - \texttt{GGMTree} class: breadth-first level-by-level tree expansion supporting both CPU and GPU backends.
+    \item \texttt{verify.py} - correctness tests: NIST known-answer tests, batch expansion self-consistency, CPU path-following determinism, and GPU vs. CPU byte-exact agreement.
+    \item \texttt{benchmark.py} - throughput benchmarking harness with matplotlib plots.
+\end{itemize}
+
+\subsection{AES-128 PRG}
+
+AES-128 is implemented entirely from scratch in two forms.
+
+The CPU implementation is written in pure Python and includes the Rijndael S-box as a 256-entry lookup table (FIPS 197, Figure 7), key expansion producing 11 round keys via RotWord, SubWord, and XOR with round constants, and the four round transformations SubBytes, ShiftRows, MixColumns, and AddRoundKey. MixColumns uses an \texttt{xtime} helper for multiplication by $x$ in GF($2^8$) modulo the AES irreducible polynomial $x^8 + x^4 + x^3 + x + 1$, with multiplication by 3 derived as $3a = \texttt{xtime}(a) \oplus a$. A full 10-round encrypt function and a batched level-expansion routine \texttt{aes\_expand\_level\_cpu} maps $N$ parent seeds to $2N$ children.
+
+The GPU implementation is a CUDA C kernel embedded in a CuPy \texttt{RawKernel}. Each CUDA thread processes one parent node independently: it runs the full AES key schedule to produce 11 round keys stored in 176 bytes of thread-local memory, then encrypts two fixed plaintexts to produce the left and right children. The S-box and round constants are placed in \texttt{\_\_constant\_\_} memory. Node seeds are stored in row-major \texttt{(N, 16)} layout so adjacent threads access adjacent rows, enabling coalesced global memory reads.
+
+\subsection{GGM Tree Expansion}
+
+The \texttt{GGMTree} class implements breadth-first level-by-level expansion. Starting from a 16-byte root seed, each level is expanded by applying the PRG to every node. At depth $d$ there are $2^d$ nodes stored as a contiguous \texttt{uint8} array of shape $(2^d, 16)$. For each node value $v$ at depth $d$ the two children are:
+\[
+v_0 = \text{PRF}_k(v \,\|\, 0), \qquad v_1 = \text{PRF}_k(v \,\|\, 1)
+\]
+On the CPU path levels are expanded sequentially. On the GPU path one kernel launch is issued per level and data stays on device between launches, with only the final leaf level transferred back to the host. No explicit inter-level synchronization is needed since CUDA guarantees in-order execution within a single stream. Peak memory usage is $O(2^{d+1} \times 16)$ bytes since only the current and next levels need to be live simultaneously.
+
+\subsection{Correctness Verification}
+
+All implemented components have been verified on the DataHub GPU cluster (8-core CPU, 16 GB RAM, 1 GPU). The test suite in \texttt{verify.py} runs four tests:
+\begin{itemize}
+    \item \textbf{Test 1a} - AES-128 against two NIST FIPS 197 known-answer test vectors (Appendix B and C.1). Both pass.
+    \item \textbf{Test 2} - Batch expansion self-consistency: each of 16 random parent nodes is expanded via \texttt{aes\_expand\_level\_cpu} and each child is verified against a direct \texttt{aes\_prf\_cpu} call. All 16 pass.
+    \item \textbf{Test 3} - GGMTree CPU determinism: 19 randomly selected leaves at depth 6 are reconstructed by tracing the root-to-leaf bit path and compared against the full \texttt{expand()} result. All 19 pass.
+    \item \textbf{Test 4} - GPU vs. CPU byte-exact agreement: full tree expansion is run on both backends at depths 4, 8, and 12, producing 16, 256, and 4096 leaves respectively. All match exactly.
+\end{itemize}
+
+\section{Challenges Encountered}
+
+\subsection{AES GF($2^8$) Arithmetic}
+
+Implementing MixColumns requires multiplication in GF($2^8$) which is not natively supported in Python or CUDA C. The \texttt{xtime} function handles multiplication by $x$ via a conditional XOR with the field polynomial, and this logic had to be replicated identically in both the Python CPU version and the CUDA C kernel to ensure bit-exact agreement between the two backends.
+
+\subsection{Non-ASCII Characters in CUDA Kernel Source}
+
+CuPy's \texttt{RawKernel} compiles kernel source using NVRTC which requires strictly ASCII input. The kernel source string contained Unicode decorative characters in inline comments, causing a \texttt{UnicodeEncodeError} at compile time. All non-ASCII characters were replaced with plain ASCII equivalents.
+
+\subsection{CuPy and NumPy Version Compatibility}
+
+DataHub ships with NumPy 2.4.6 while the installed CuPy wheel was compiled against NumPy 1.x, causing an \texttt{\_ARRAY\_API not found} import error on load. Updating to a CuPy wheel compiled against NumPy 2.x resolved the conflict and all tests pass cleanly.
+
+\section{Plans and Remaining Milestones}
+
+\subsection{BLAKE2s PRG (CPU and GPU)}
+
+\subsection{Benchmark Harness}
+
+\subsection{GPU Benchmark Results}
+
+\subsection{Performance-Security Tradeoff Analysis}
+
+\subsection{Final Report (IEEE Format)}
+
+\section{Timeline}
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+\textbf{Milestone} & \textbf{Target} \\
+\hline
+BLAKE2s CPU and GPU implementation & Week 9 \\
+Benchmark harness and CPU results  & Week 9 \\
+GPU benchmark results              & Week 10 \\
+Performance-security analysis      & Week 10 \\
+Final report (IEEE LaTeX)          & Finals week \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{document}

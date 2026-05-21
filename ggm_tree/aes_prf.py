@@ -1,0 +1,366 @@
+"""
+aes_prf.py — AES-128 based PRG for GGM tree construction.
+
+PRG definition:
+    G(k) = AES_k(0^128) || AES_k(1 || 0^120)
+
+both the cpu and gpu implementations are written from scratch — no crypto libraries.
+the cpu version uses plain python lists; the gpu version is a cupy rawkernel (cuda c).
+ecb mode is safe here because each node key is independent (no need for an iv or chaining).
+"""
+
+import numpy as np
+
+# cpu implementation
+
+# rijndael substitution box (FIPS 197, figure 7)
+SBOX = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+]
+
+# round constants: RCON[i] = x^i in GF(2^8), for i = 1..10 (indices 0..9 here)
+RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+
+
+def xtime(b: int) -> int:
+    """
+    multiply byte b by x (i.e. by 2) in GF(2^8) = GF(2)[x]/(x^8+x^4+x^3+x+1)
+    """
+    return ((b << 1) ^ 0x1b) & 0xff if b & 0x80 else (b << 1) & 0xff
+
+
+def sub_bytes(state: list) -> list:
+    """
+    apply sbox substitution to each byte of the 16-byte state
+    """
+    return [SBOX[b] for b in state]
+
+
+def shift_rows(state: list) -> list:
+    """
+    cyclic left shift rows: row r shifts left by r positions
+
+    state is column-major: column c occupies flat indices 4c, 4c+1, 4c+2, 4c+3.
+    row r contains indices r, r+4, r+8, r+12.
+    """
+    s = state
+    return [
+        s[ 0], s[ 5], s[10], s[15],   # row 0: no shift
+        s[ 4], s[ 9], s[14], s[ 3],   # row 1: shift left 1
+        s[ 8], s[13], s[ 2], s[ 7],   # row 2: shift left 2
+        s[12], s[ 1], s[ 6], s[11],   # row 3: shift left 3
+    ]
+
+
+def mix_columns(state: list) -> list:
+    """
+    mix each column using the AES MDS matrix in GF(2^8)
+
+    column [a0,a1,a2,a3] maps to [b0,b1,b2,b3] per FIPS 197 eq. 4.13:
+    b0 = 2*a0 ^ 3*a1 ^   a2 ^   a3
+    b1 =   a0 ^ 2*a1 ^ 3*a2 ^   a3
+    b2 =   a0 ^   a1 ^ 2*a2 ^ 3*a3
+    b3 = 3*a0 ^   a1 ^   a2 ^ 2*a3
+    where 3*x = xtime(x) ^ x
+    """
+    result = list(state)
+    for c in range(4):
+        a0 = state[4*c];   a1 = state[4*c+1]
+        a2 = state[4*c+2]; a3 = state[4*c+3]
+        result[4*c]   = xtime(a0) ^ xtime(a1) ^ a1 ^ a2 ^ a3
+        result[4*c+1] = a0 ^ xtime(a1) ^ xtime(a2) ^ a2 ^ a3
+        result[4*c+2] = a0 ^ a1 ^ xtime(a2) ^ xtime(a3) ^ a3
+        result[4*c+3] = xtime(a0) ^ a0 ^ a1 ^ a2 ^ xtime(a3)
+    return result
+
+
+def add_round_key(state: list, rk: list) -> list:
+    """
+    xor state with a round key (both flat 16 int lists)
+    """
+    return [a ^ b for a, b in zip(state, rk)]
+
+
+def key_expansion(key: bytes) -> list:
+    """
+    expand a 16 byte key into 11 round keys (FIPS 197 section 5.2)
+
+    returns:
+        list of 11 items each a flat list of 16 ints
+        key schedule produces 44 words (w[0..43]) and round key r uses w[4r..4r+3]
+    """
+    # seed word array from the original key
+    w = [list(key[4*i : 4*i+4]) for i in range(4)]
+
+    for i in range(4, 44):
+        temp = w[i-1][:]
+        if i % 4 == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [SBOX[b] for b in temp]
+            temp[0] ^= RCON[i // 4 - 1]
+        w.append([a ^ b for a, b in zip(w[i-4], temp)])
+
+    # repack into 11 flat 16 byte round keys
+    round_keys = []
+    for r in range(11):
+        rk = []
+        for word in range(4):
+            rk.extend(w[r*4 + word])
+        round_keys.append(rk)
+    return round_keys
+
+
+def aes_encrypt_block(block: bytes, key: bytes) -> bytes:
+    """encrypt one 16-byte block with AES-128 (10 rounds, FIPS 197 section 5.1)."""
+    assert len(block) == 16 and len(key) == 16
+    rks = key_expansion(key)
+    state = list(block)
+
+    state = add_round_key(state, rks[0])
+
+    for r in range(1, 10):
+        state = sub_bytes(state)
+        state = shift_rows(state)
+        state = mix_columns(state)
+        state = add_round_key(state, rks[r])
+
+    # final round omits mix_columns
+    state = sub_bytes(state)
+    state = shift_rows(state)
+    state = add_round_key(state, rks[10])
+
+    return bytes(state)
+
+
+def aes_prf_cpu(key: bytes) -> tuple:
+    """evaluate the AES-128 PRG on a single 16-byte key.
+
+    returns (left_child, right_child) each 16 bytes, where:
+        left  = AES_key(0x00 * 16)
+        right = AES_key(0x01 + 0x00 * 15)
+    """
+    assert len(key) == 16, "AES key must be exactly 16 bytes"
+    left  = aes_encrypt_block(b"\x00" * 16,        key)
+    right = aes_encrypt_block(b"\x01" + b"\x00"*15, key)
+    return left, right
+
+
+def aes_expand_level_cpu(keys: np.ndarray) -> np.ndarray:
+    """expand one GGM tree level on cpu (sequential).
+
+    args:
+        keys: uint8 array of shape (N, 16) parent node seeds.
+    returns:
+        uint8 array of shape (2N, 16) children [left_0, right_0, left_1, right_1, ...]
+    """
+    n = keys.shape[0]
+    children = np.empty((2 * n, 16), dtype=np.uint8)
+    for i in range(n):
+        k = bytes(keys[i])
+        left, right = aes_prf_cpu(k)
+        children[2 * i]     = np.frombuffer(left,  dtype=np.uint8)
+        children[2 * i + 1] = np.frombuffer(right, dtype=np.uint8)
+    return children
+
+
+# gpu implementation (CuPy RawKernel)
+_AES_KERNEL_SRC = r"""
+/*
+ * AES-128 ECB encryption kernel for GGM tree expansion.
+ *
+ * each CUDA thread processes one parent node:
+ *   - reads its 16-byte key from keys[tid*16 -> tid*16+15]
+ *   - expands the key schedule (11 round keys, 176 bytes total)
+ *   - encrypts plaintext_0 = 0x00*16  -> left  child at out[(2*tid  )*16]
+ *   - encrypts plaintext_1 = 0x01,0.. -> right child at out[(2*tid+1)*16]
+ *
+ * memory layout (N, 16) row-major keeps each node's bytes contiguous per
+ * thread, enabling coalesced global memory access within a warp.
+ *
+ * the AES S-box (256 bytes) is in __constant__ memory to avoid repeated
+ * global memory lookups across all rounds.
+ */
+
+// AES S-box (Rijndael)
+__constant__ unsigned char AES_SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+// AES round constants for key schedule
+__constant__ unsigned char RCON[11] = {
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+};
+
+// multiply by 2 in GF(2^8)
+__device__ __forceinline__ unsigned char xtime(unsigned char x) {
+    return (unsigned char)(((unsigned int)x << 1) ^ (((unsigned int)x >> 7) & 1 ? 0x1b : 0x00));
+}
+
+// expand 16-byte key into 11 round keys (176 bytes)
+__device__ void ExpandKey(const unsigned char* key, unsigned char* rk) {
+    for (int i = 0; i < 16; i++) rk[i] = key[i];
+
+    for (int i = 1; i <= 10; i++) {
+        unsigned char* prev = rk + (i - 1) * 16;
+        unsigned char* cur  = rk + i * 16;
+
+        unsigned char t0 = AES_SBOX[prev[13]] ^ RCON[i];
+        unsigned char t1 = AES_SBOX[prev[14]];
+        unsigned char t2 = AES_SBOX[prev[15]];
+        unsigned char t3 = AES_SBOX[prev[12]];
+
+        cur[0] = prev[0] ^ t0;
+        cur[1] = prev[1] ^ t1;
+        cur[2] = prev[2] ^ t2;
+        cur[3] = prev[3] ^ t3;
+        for (int j = 4; j < 16; j++) cur[j] = prev[j] ^ cur[j - 4];
+    }
+}
+
+__device__ void SubBytes(unsigned char* state) {
+    for (int i = 0; i < 16; i++) state[i] = AES_SBOX[state[i]];
+}
+
+// state is column-major: bytes 0-3 = col 0, bytes 4-7 = col 1, etc.
+__device__ void ShiftRows(unsigned char* s) {
+    unsigned char tmp;
+    // row 1: rotate left by 1
+    tmp = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = tmp;
+    // row 2: rotate left by 2
+    tmp = s[2]; s[2] = s[10]; s[10] = tmp;
+    tmp = s[6]; s[6] = s[14]; s[14] = tmp;
+    // row 3: rotate left by 3
+    tmp = s[3]; s[3] = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = tmp;
+}
+
+__device__ void MixColumns(unsigned char* s) {
+    for (int col = 0; col < 4; col++) {
+        unsigned char a0 = s[col*4+0];
+        unsigned char a1 = s[col*4+1];
+        unsigned char a2 = s[col*4+2];
+        unsigned char a3 = s[col*4+3];
+        unsigned char x2a0 = xtime(a0), x2a1 = xtime(a1), x2a2 = xtime(a2), x2a3 = xtime(a3);
+        s[col*4+0] = x2a0 ^ (x2a1^a1) ^ a2 ^ a3;
+        s[col*4+1] = a0 ^ x2a1 ^ (x2a2^a2) ^ a3;
+        s[col*4+2] = a0 ^ a1 ^ x2a2 ^ (x2a3^a3);
+        s[col*4+3] = (x2a0^a0) ^ a1 ^ a2 ^ x2a3;
+    }
+}
+
+__device__ void AddRoundKey(unsigned char* state, const unsigned char* rk) {
+    for (int i = 0; i < 16; i++) state[i] ^= rk[i];
+}
+
+__device__ void AES_encrypt(const unsigned char* in,
+                             unsigned char* out,
+                             const unsigned char* rk) {
+    unsigned char state[16];
+    for (int i = 0; i < 16; i++) state[i] = in[i];
+
+    AddRoundKey(state, rk);
+
+    for (int round = 1; round <= 9; round++) {
+        SubBytes(state);
+        ShiftRows(state);
+        MixColumns(state);
+        AddRoundKey(state, rk + round * 16);
+    }
+    // final round: no MixColumns
+    SubBytes(state);
+    ShiftRows(state);
+    AddRoundKey(state, rk + 10 * 16);
+
+    for (int i = 0; i < 16; i++) out[i] = state[i];
+}
+
+// main kernel: expand N parent nodes into 2N children
+extern "C" __global__
+void aes_expand_level(const unsigned char* __restrict__ keys,
+                            unsigned char* __restrict__ out,
+                      int N)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+
+    unsigned char rk[176];
+    ExpandKey(keys + tid * 16, rk);
+
+    unsigned char pt0[16] = {0};
+    AES_encrypt(pt0, out + (2 * tid)     * 16, rk);
+
+    unsigned char pt1[16] = {0};
+    pt1[0] = 0x01;
+    AES_encrypt(pt1, out + (2 * tid + 1) * 16, rk);
+}
+"""
+
+_aes_kernel = None
+
+def _get_aes_kernel():
+    """
+    compile and return the CuPy RawKernel for AES expansion
+    """
+    global _aes_kernel
+    if _aes_kernel is None:
+        try:
+            import cupy as cp
+            _aes_kernel = cp.RawKernel(_AES_KERNEL_SRC, "aes_expand_level")
+        except ImportError:
+            raise RuntimeError(
+                "CuPy is required for GPU AES. Install with: pip install cupy-cuda11x"
+            )
+    return _aes_kernel
+
+
+def aes_expand_level_gpu(keys_gpu):
+    """expand one GGM tree level on the GPU using the AES-128 PRG.
+
+    args:
+        keys_gpu: CuPy uint8 array of shape (N, 16) parent node seeds on device.
+    returns:
+        CuPy uint8 array of shape (2N, 16) children on device.
+        data stays on device between levels to avoid PCIe round-trips.
+    """
+    import cupy as cp
+
+    n = keys_gpu.shape[0]
+    out_gpu = cp.empty((2 * n, 16), dtype=cp.uint8)
+
+    kernel = _get_aes_kernel()
+    threads_per_block = 256
+    blocks = (n + threads_per_block - 1) // threads_per_block
+    kernel(
+        (blocks,), (threads_per_block,),
+        (keys_gpu, out_gpu, np.int32(n))
+    )
+    return out_gpu
