@@ -38,9 +38,6 @@ launch, making it an ideal accelerator for large trees.
 | AES-128 | `AES_k(0^128) \|\| AES_k(1*0^120)` - encrypt two fixed plaintexts with key `k` in ECB mode |
 | BLAKE2s | `BLAKE2s(key=k, data=0x00, digest=16) \|\| BLAKE2s(key=k, data=0x01, digest=16)` |
 
-ECB mode is safe here because each node key is independent — no semantic relationship
-between siblings — so no IV or chaining is needed.
-
 ---
 
 ## File Structure
@@ -222,8 +219,8 @@ the header-free style already used by the AES kernel.
 - [x] Performance–security trade-off analysis (AES vs BLAKE2s)
 - [x] Final report (`reports/final_report.pdf`)
 - [x] Progress report (`reports/progress_report.pdf`)
-- [x] 2.5-minute in-class presentation (Jun 4)
+- [x] 2.5-minute in-class presentation
 
 ### To be done
-- [ ] 10-minute recorded presentation (due Jun 12)
+- [ ] 10-minute recorded presentation
 - [ ] Pure CUDA implementation without CuPy layer (bonus)
