@@ -1,18 +1,18 @@
 """
-benchmark.py — timing and throughput benchmarks for GGM tree expansion
+benchmark.py: timing and throughput benchmarks for GGM tree expansion
 
 measures wall-clock time (time.perf_counter) for all combinations of:
-    PRF    in {aes, blake2s}
+    PRF in {aes, blake2s}
     device in {cpu, gpu}
-    depth  in {4, 8, 12, 16, 20}  -> 16 to 1,048,576 leaves
+    depth in {4, 8, 12, 16, 20}  -> 16 to 1,048,576 leaves
 
 gpu timing: one warm-up run before each timed series; stream sync after each run
 so the timer captures actual gpu completion rather than just kernel enqueue time
 
 outputs:
     - formatted results table printed to stdout
-    - benchmark_throughput.png  throughput (leaves/s) vs depth, log y scale
-    - benchmark_speedup.png     GPU/CPU speedup vs depth (only if GPU available)
+    - benchmark_throughput.png: throughput (leaves/s) vs depth, log y scale
+    - benchmark_speedup.png: GPU/CPU speedup vs depth (only if GPU available)
 """
 
 import sys
@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ggm_tree import GGMTree
 
 # configuration
-DEPTHS    = [4, 8, 12, 16, 20]
+DEPTHS    = [4, 8, 12, 16]
 PRFS      = ["aes", "blake2s"]
 ROOT_SEED = bytes(range(16))
 N_REPEATS = 3

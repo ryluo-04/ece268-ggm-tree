@@ -65,13 +65,13 @@ def test_aes_nist_vectors() -> bool:
     return passed
 
 
-# test 1b: BLAKE2s hashlib cross-check
+# test 1b: BLAKE2s comparison to hashlib
 
 def test_blake2s_hashlib() -> bool:
     """
-    compare blake2s_prf_cpu against hashlib directly for 8 random keys
+    compare blake2s_prf_cpu against hashlib reference for 8 random keys
     """
-    print("\n[Test 1b] BLAKE2s — hashlib cross-check")
+    print("\n[Test 1b] BLAKE2s — comparison to hashlib")
     passed = True
     rng = np.random.default_rng(99)
     for i in range(8):
